@@ -67,7 +67,8 @@ json_header <- c('Accept'="application/json")
 result <- httr::POST(onto_endpoint,
                      body = list(query = SPARQL_query),
                      httr::user_agent(R.version.string),
-                     httr::add_headers(json_header))
+                     httr::add_headers(json_header),
+                    httr::timeout(120))
 
 # Will show a warning/error if there is any
 httr::stop_for_status(result)

@@ -17,7 +17,10 @@ source("endpoints.R")
 
 library(magrittr)
 
-rds_file <- "data/species_in_PRO.rds"
+rds_file <- normalizePath(
+  file.path("..", "data", "species_in_PRO.rds"),
+  mustWork = FALSE
+)
 
 if (file.exists(rds_file)) {
   

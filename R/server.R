@@ -2539,7 +2539,7 @@ server_app <- function(input, output, session) {
       result <- httr::GET(
         url = wiki_endpoint,
         query = list(query = SPARQL_query),
-        httr::user_agent(R.version.string))
+        httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
       # Will show a warning/error if there is any
       httr::stop_for_status(result)
@@ -2874,136 +2874,261 @@ server_app <- function(input, output, session) {
       }
 
       ## Wikidata, then SPAPRQL query to PRO
-
       # Query Wikidata, then if there are synonyms query them in PRO
-
+      
+      ######## Wikidata, then SPAPRQL query to PRO ########
+      
+      # Query Wikidata, then if there are synonyms query them in PRO
+      
       Match_step <- "Wikidata"
-
+      
       # Vector of unique marker names
       unique_marker_names <- CD_syn_list_matches$Marker[CD_syn_list_matches$Match_step != "CD synonym list"]
-
+      
       # Remove duplicates introduces by synonyms from last step
       remove <- CD_syn_list_matches$Marker[CD_syn_list_matches$Match_step != ""]
       unique_marker_names <-  dplyr::setdiff(unique_marker_names, remove)
-
+      
       all_ids_final <- list()
-
-      if(length(unique_marker_names) != 0){
+      
+      if(length(unique_marker_names) != 0) {
         if(unique_marker_names[1] != "") {
-
+          
           # Loop through each and do the SPARQL query
           for(marker in unique_marker_names) {
-
-            specific_marker <-  shQuote(marker)
-
+            
+            specific_marker <- shQuote(marker)
+            
             SPARQL_query <-
               paste0(
                 "
 SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
-  # Look either for non-species specific or add a specific species
+
   OPTIONAL {
     ?item wdt:P703 <", wikidata_taxon_ID, "> .
-
   }
-  # Get Wikidata protein name and alternative names
+
   ?item rdfs:label ?itemLabel .
-  ?item skos:altLabel ?altLabel.
-  # Return results that are either proteins or protein-coding genes
-  {?item wdt:P31 wd:Q8054}
+  ?item skos:altLabel ?altLabel .
+
+  { ?item wdt:P31 wd:Q8054 }
   UNION
-  {?item wdt:P279 wd:Q20747295}
-  # Search for the marker input, either if it is the entry name or an alternative name
-  FILTER (UCASE(REPLACE(str(?itemLabel),'[ -.]','')) = ", specific_marker, " || UCASE(REPLACE(str(?altLabel),'[ -.]','')) = ", specific_marker, ")
+  { ?item wdt:P279 wd:Q20747295 }
+
+  FILTER (
+    UCASE(REPLACE(str(?itemLabel),'[ -.]','')) = ", specific_marker, "
+    ||
+    UCASE(REPLACE(str(?altLabel),'[ -.]','')) = ", specific_marker, "
+  )
 }
-")
+"
+              )
+            
+            # Retry Wikidata request
+            result <- NULL
+            
+            for(attempt in 1:5) {
+              
+              result <- tryCatch(
+                httr::GET(
+                  url = wiki_endpoint,
+                  query = list(query = SPARQL_query),
+                  httr::user_agent(
+                    "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)"
+                  )
+                ),
+                error = function(e) NULL
+              )
+              
+              if (!is.null(result) &&
+                  httr::status_code(result) == 200) {
+                break
+              }
+              
+              Sys.sleep(2 ^ attempt)
+            }
+            
+            # Check HTTP response
+            if (is.null(result)) {
+              
+              all_ids_final[[marker]] <- data.frame(
+                PRO_term = "",
+                PRO_name = "",
+                Species = "",
+                Match_step = "",
+                Match_type = ""
+              )
+              
+              next
+            }
+            
+            status <- httr::status_code(result)
+            
+            if (status != 200) {
+              
+              all_ids_final[[marker]] <- data.frame(
+                PRO_term = "",
+                PRO_name = "",
+                Species = "",
+                Match_step = "",
+                Match_type = ""
+              )
+              
+              next
+            }
+            
+            # Get response text
+            x <- httr::content(
+              result,
+              as = "text",
+              encoding = "UTF-8"
+            )
+            
+            # Validate JSON
+            if (!jsonlite::validate(x)) {
 
-            # Run SPARQL on the endpoint
-            result <- httr::GET(
-              url = wiki_endpoint,
-              query = list(query = SPARQL_query),
-              httr::user_agent(R.version.string))
-
-            # Will show a warning/error if there is any
-            httr::stop_for_status(result)
-
-            # Get result in text JSON
-            x <- httr::content(result, as = "text") #, encoding = "UTF-8")
-
-            # Convert from JSON to a list
-            df <- jsonlite::fromJSON(x, flatten = TRUE)
-
-            # Extract the data frame
+              all_ids_final[[marker]] <- data.frame(
+                PRO_term = "",
+                PRO_name = "",
+                Species = "",
+                Match_step = "",
+                Match_type = ""
+              )
+              
+              next
+            }
+            
+            # Parse JSON
+            df <- tryCatch(
+              jsonlite::fromJSON(x, flatten = TRUE),
+              error = function(e) NULL
+            )
+            
+            if (is.null(df)) {
+              
+              all_ids_final[[marker]] <- data.frame(
+                PRO_term = "",
+                PRO_name = "",
+                Species = "",
+                Match_step = "",
+                Match_type = ""
+              )
+              
+              next
+            }
+            
             df <- df$results$bindings
-
+            
             if (length(df) != 0) {
-
-              # Remove unneeded info
-              df <- df %>% dplyr::select(-dplyr::ends_with(c(".type", ".datatype", 'lang')))
-
-              # Remove this part that was added onto the column names
+              
+              df <- df %>%
+                dplyr::select(
+                  -dplyr::ends_with(
+                    c(".type", ".datatype", "lang")
+                  )
+                )
+              
               colnames(df) <- gsub(".value", "", colnames(df))
-
-              # Make everything case, remove spaces, dashes
+              
               df <- dplyr::mutate_all(df, .funs = toupper)
+              
               df <- as.data.frame(lapply(df, function(y) gsub('-', '', y)))
               df <- as.data.frame(lapply(df, function(y) gsub('_', '', y)))
               df <- as.data.frame(lapply(df, function(y) gsub(' ', '', y)))
               df <- as.data.frame(lapply(df, function(y) gsub('\\.', '', y)))
-
-              df <- df[(which(nchar(df$altLabel) > 2)),]
-              df <- df[(which(nchar(df$itemLabel) > 2)),]
-
-              # No marker can start with a number, so add X to any marker names that start with a number
-              df <- as.data.frame(lapply(df, function(y) gsub('^(\\d)', 'X\\1', y)))
-
-              # Vector of unique marker names
-              unique_syn_names <- unique(c(df[, "altLabel"], df[, "itemLabel"]))
-
-              unique_syn_names <- unique_syn_names[!grepl("[^\x01-\x7F]+", unique_syn_names)]
-
-              unique_syn_names <- unique_syn_names[grep('[A-Za-z]',unique_syn_names)]
-
-              unique_syn_names <- unique_syn_names[!grepl(paste0('^', marker, '$'), unique_syn_names, useBytes = TRUE)]
-
-              # Run SPARQL
-              all_ids <- PRO_SPARQL(unique_marker_names = unique_syn_names,
-                                    NCBI_taxon_ID = NCBI_taxon_ID_short,
-                                    onto_endpoint = onto_endpoint,
-                                    Match_step = Match_step)
-
-              # Put all results in one data frame
-              all_ids <- dplyr::bind_rows(all_ids, .id = "Matched synonym")
-
+              
+              df <- df[which(nchar(df$altLabel) > 2), ]
+              df <- df[which(nchar(df$itemLabel) > 2), ]
+              
+              df <- as.data.frame(
+                lapply(df, function(y)
+                  gsub('^(\\d)', 'X\\1', y))
+              )
+              
+              unique_syn_names <- unique(
+                c(df[, "altLabel"], df[, "itemLabel"])
+              )
+              
+              unique_syn_names <-
+                unique_syn_names[
+                  !grepl("[^\x01-\x7F]+", unique_syn_names)
+                ]
+              
+              unique_syn_names <-
+                unique_syn_names[
+                  grep('[A-Za-z]', unique_syn_names)
+                ]
+              
+              unique_syn_names <-
+                unique_syn_names[
+                  !grepl(
+                    paste0('^', marker, '$'),
+                    unique_syn_names,
+                    useBytes = TRUE
+                  )
+                ]
+              
+              all_ids <- PRO_SPARQL(
+                unique_marker_names = unique_syn_names,
+                NCBI_taxon_ID = NCBI_taxon_ID_short,
+                onto_endpoint = onto_endpoint,
+                Match_step = Match_step
+              )
+              
+              all_ids <- dplyr::bind_rows(
+                all_ids,
+                .id = "Matched synonym"
+              )
+              
               all_ids <- stats::na.omit(all_ids)
-
+              
               if (length(all_ids) != 0) {
+                
                 all_ids_final[[marker]] <- all_ids
-              } else if (length(all_ids) == 0) {
-                all_ids_final[[marker]] <- data.frame(PRO_term = "", PRO_name = "", Species = "", Match_step = "", Match_type = "")
+                
+              } else {
+                
+                all_ids_final[[marker]] <- data.frame(
+                  PRO_term = "",
+                  PRO_name = "",
+                  Species = "",
+                  Match_step = "",
+                  Match_type = ""
+                )
+                
               }
-            } else if (length(df) == 0) {
-              all_ids_final[[marker]] <- data.frame(PRO_term = "", PRO_name = "", Species = "", Match_step = "", Match_type = "")
+              
+            } else {
+              
+              all_ids_final[[marker]] <- data.frame(
+                PRO_term = "",
+                PRO_name = "",
+                Species = "",
+                Match_step = "",
+                Match_type = ""
+              )
+              
             }
           }
-
+        
         # Put all results in one data frame
         all_ids_final2 <- dplyr::bind_rows(all_ids_final, .id = "Marker")
-
+        
         # Remove duplicated entries (Marker, PRO term, and type of match are the same)
         all_ids_final2 <- all_ids_final2[!duplicated(all_ids_final2[,c("Marker","PRO_term", "Match_type")]),]
-
+        
         # Get entries were inputted marker and matched species is the same
-
+        
         # Subset into entries with and without duplicates
         x <-  all_ids_final2[duplicated(all_ids_final2[,c("Marker","Species")]) | duplicated(all_ids_final2[,c("Marker","Species")], fromLast = TRUE) ,]
         y <-  dplyr::setdiff(all_ids_final2, x)
-
+        
         # Get vector of markers (duplicates)
         unique_marker_names <- unique(x$Marker)
-
+        
         # If there is both an exact match and a secondary match, remove the secondary
         remove_secondary_per_marker <- data.frame()
-
+        
         for(marker in unique_marker_names) {
           df_subsetted <- x[x$Marker == marker,]
           if(any(df_subsetted$Match_type == "Primary")) {
@@ -3015,20 +3140,20 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             remove_secondary_per_marker <- rbind(remove_secondary_per_marker, df_per_marker)
           }
         }
-
+        
         # Final
         Wikidata_matches <- rbind(remove_secondary_per_marker, y)
-
+        
         # Just columns we want
         Wikidata_matches <- unique(Wikidata_matches[ , c("Marker", "PRO_term", "PRO_name", "Species", "Match_type", "Match_step")])
-
+        
         } else {
           Wikidata_matches <- data.frame(Marker = "", PRO_term = "", PRO_name = "", Species = "", Match_type = "", Match_step = "")
         }
       } else {
         Wikidata_matches <- data.frame(Marker = "", PRO_term = "", PRO_name = "", Species = "", Match_type = "", Match_step = "")
       }
-
+  
     ## Final results
 
     # Put everything together and get the final list of matched/unmatched marker names
@@ -3326,7 +3451,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
     result <- httr::GET(
       url = wiki_endpoint,
       query = list(query = SPARQL_query),
-      httr::user_agent(R.version.string))
+      httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
     # Will show a warning/error if there is any
     httr::stop_for_status(result)
@@ -3598,7 +3723,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
           result <- httr::GET(
             url = wiki_endpoint,
             query = list(query = SPARQL_query),
-            httr::user_agent(R.version.string))
+            httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
           # Get result in text JSON
           x <- httr::content(result, as = "text") #, encoding = "UTF-8")
@@ -3857,7 +3982,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
         result <- httr::POST(
           onto_endpoint,
           body = list(query = query),
-          httr::user_agent(R.version.string)
+          httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" )
         )
         
         if (httr::status_code(result) != 200) {
@@ -4613,7 +4738,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result1 <- httr::POST(onto_endpoint,
                                   body = list(query = query1),
-                                  httr::user_agent(R.version.string))
+                                  httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result1)
@@ -4699,7 +4824,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result1 <- httr::POST(onto_endpoint,
                                   body = list(query = query1),
-                                  httr::user_agent(R.version.string))
+                                  httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result1)
@@ -4783,7 +4908,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result2 <- httr::POST(onto_endpoint,
                                   body = list(query = query2),
-                                  httr::user_agent(R.version.string))
+                                  httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result2)
@@ -5201,7 +5326,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               # Run SPARQL on the endpoint
               result1 <- httr::POST(onto_endpoint,
                                     body = list(query = query1),
-                                    httr::user_agent(R.version.string))
+                                    httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
               # Will show a warning/error if there is any
               httr::stop_for_status(result1)
@@ -5285,7 +5410,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               # Run SPARQL on the endpoint
               result1 <- httr::POST(onto_endpoint,
                                     body = list(query = query1),
-                                    httr::user_agent(R.version.string))
+                                    httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
               # Will show a warning/error if there is any
               httr::stop_for_status(result1)
@@ -5369,7 +5494,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               # Run SPARQL on the endpoint
               result2 <- httr::POST(onto_endpoint,
                                     body = list(query = query2),
-                                    httr::user_agent(R.version.string))
+                                    httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
               # Will show a warning/error if there is any
               httr::stop_for_status(result2)
@@ -5567,7 +5692,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result <- httr::POST(onto_endpoint,
                                  body = list(query = query),
-                                 httr::user_agent(R.version.string))
+                                 httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result)
@@ -5687,22 +5812,67 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
 }"
               )
 
-            # Run SPARQL on the endpoint
-            result <- httr::GET(
-              url = wiki_endpoint,
-              query = list(query = SPARQL_query),
-              httr::user_agent(R.version.string))
-
-            # Will show a warning/error if there is any
-            httr::stop_for_status(result)
-
-            # Get result in text JSON
-            x <- httr::content(result, as = "text") #, encoding = "UTF-8")
-
-            # Convert from JSON to a list
-            df <- jsonlite::fromJSON(x, flatten = TRUE)
-
-            # Extract the data frame
+            # Query Wikidata with retries
+            result <- NULL
+            
+            for(attempt in 1:5) {
+              
+              result <- tryCatch(
+                httr::GET(
+                  url = wiki_endpoint,
+                  query = list(query = SPARQL_query),
+                  httr::user_agent(
+                    "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)"
+                  )
+                ),
+                error = function(e) NULL
+              )
+              
+              if(!is.null(result) &&
+                 httr::status_code(result) == 200) {
+                break
+              }
+              
+              Sys.sleep(2^attempt)
+            }
+            
+            # If still failed after retries
+            if(is.null(result) ||
+               httr::status_code(result) != 200) {
+              
+              final_matched_output[i, "Wikidata"] <- ""
+              
+              next
+            }
+            
+            # Get response text
+            x <- httr::content(
+              result,
+              as = "text",
+              encoding = "UTF-8"
+            )
+            
+            # Verify JSON
+            if(!jsonlite::validate(x)) {
+              
+              final_matched_output[i, "Wikidata"] <- ""
+              
+              next
+            }
+            
+            # Parse JSON
+            df <- tryCatch(
+              jsonlite::fromJSON(x, flatten = TRUE),
+              error = function(e) NULL
+            )
+            
+            if(is.null(df)) {
+              
+              final_matched_output[i, "Wikidata"] <- ""
+              
+              next
+            }
+            
             df <- df$results$bindings
 
             # Put the results in a list of data frames
@@ -7679,7 +7849,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
       result <- httr::GET(
         url = wiki_endpoint,
         query = list(query = SPARQL_query),
-        httr::user_agent(R.version.string))
+        httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
       # Will show a warning/error if there is any
       httr::stop_for_status(result)
@@ -8015,155 +8185,274 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
       }
 
       ## Wikidata, then SPAPRQL query to PRO
-
-      # Query Wikidata, then if there are synonyms query them in PRO
-
+      
       Match_step <- "Wikidata"
-
+      
       # Vector of unique marker names
       unique_marker_names <- CD_syn_list_matches$Marker[CD_syn_list_matches$Match_step != "CD synonym list"]
-
+      
       # Remove duplicates introduces by synonyms from last step
       remove <- CD_syn_list_matches$Marker[CD_syn_list_matches$Match_step != ""]
       unique_marker_names <-  dplyr::setdiff(unique_marker_names, remove)
-
+      
       all_ids_final <- list()
-
+      
       if(length(unique_marker_names) != 0){
         if(unique_marker_names[1] != "") {
-
+          
+          
           # Loop through each and do the SPARQL query
           for(marker in unique_marker_names) {
-
-            specific_marker <-  shQuote(marker)
-
+            
+            specific_marker <- shQuote(marker)
+            
             SPARQL_query <-
               paste0(
                 "
 SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
-  # Look either for non-species specific or add a specific species
+
   OPTIONAL {
     ?item wdt:P703 <", wikidata_taxon_ID, "> .
-
   }
-  # Get Wikidata protein name and alternative names
+
   ?item rdfs:label ?itemLabel .
   ?item skos:altLabel ?altLabel.
-  # Return results that are either proteins or protein-coding genes
+
   {?item wdt:P31 wd:Q8054}
   UNION
   {?item wdt:P279 wd:Q20747295}
-  # Search for the marker input, either if it is the entry name or an alternative name
-  FILTER (UCASE(REPLACE(str(?itemLabel),'[ -.]','')) = ", specific_marker, " || UCASE(REPLACE(str(?altLabel),'[ -.]','')) = ", specific_marker, ")
+
+  FILTER (
+    UCASE(REPLACE(str(?itemLabel),'[ -.]','')) = ", specific_marker, "
+    ||
+    UCASE(REPLACE(str(?altLabel),'[ -.]','')) = ", specific_marker, "
+  )
 }
-")
-
-            # Run SPARQL on the endpoint
-            result <- httr::GET(
-              url = wiki_endpoint,
-              query = list(query = SPARQL_query),
-              httr::user_agent(R.version.string))
-
-
-            # Will show a warning/error if there is any
-            httr::stop_for_status(result)
-
-            # Get result in text JSON
-            x <- httr::content(result, as = "text") #, encoding = "UTF-8")
-
-            # Convert from JSON to a list
+"
+              )
+            
+            result <- NULL
+            
+            for(attempt in 1:5) {
+              
+              retry_after <- NULL
+              
+              if (!is.null(result)) {
+                retry_after <- httr::headers(result)[["retry-after"]]
+              }
+              
+              if(!is.null(retry_after)) {
+                Sys.sleep(as.numeric(retry_after))
+              } else {
+                Sys.sleep(2^attempt)
+              }
+              
+              result <- tryCatch(
+                
+                httr::GET(
+                  url = wiki_endpoint,
+                  query = list(query = SPARQL_query),
+                  httr::user_agent(
+                    "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)"
+                  ),
+                  httr::timeout(30)
+                ),
+                
+                error = function(e) NULL
+                
+              )
+              
+              if(is.null(result)) {
+                
+                Sys.sleep(2 ^ attempt)
+                next
+                
+              }
+              
+              status <- httr::status_code(result)
+              
+              if(status < 400) {
+                break
+              }
+              
+              if(status %in% c(403, 429, 500, 502, 503, 504)) {
+                
+                Sys.sleep(2 ^ attempt)
+                
+              } else {
+                
+                break
+                
+              }
+            }
+            
+            if(is.null(result) ||
+               httr::status_code(result) >= 400) {
+              
+              warning(
+                paste(
+                  "Wikidata lookup failed for",
+                  marker,
+                  "- continuing analysis"
+                )
+              )
+              
+              all_ids_final[[marker]] <-
+                data.frame(
+                  PRO_term = "",
+                  PRO_name = "",
+                  Species = "",
+                  Match_step = "",
+                  Match_type = ""
+                )
+              
+              next
+            }
+            
+            x <- httr::content(result, as = "text")
+            
             df <- jsonlite::fromJSON(x, flatten = TRUE)
-
-            # Extract the data frame
+            
             df <- df$results$bindings
-
-            if (length(df) != 0) {
-
-              # Remove unneeded info
-              df <- df %>% dplyr::select(-dplyr::ends_with(c(".type", ".datatype", 'lang')))
-
-              # Remove this part that was added onto the column names
+            
+            if(length(df) != 0) {
+              
+              df <- df %>%
+                dplyr::select(
+                  -dplyr::ends_with(
+                    c(".type", ".datatype", "lang")
+                  )
+                )
+              
               colnames(df) <- gsub(".value", "", colnames(df))
-
-              # Make everything case, remove spaces, dashes
+              
               df <- dplyr::mutate_all(df, .funs = toupper)
-              df <- as.data.frame(lapply(df, function(y) gsub('-', '', y)))
-              df <- as.data.frame(lapply(df, function(y) gsub('_', '', y)))
-              df <- as.data.frame(lapply(df, function(y) gsub(' ', '', y)))
-              df <- as.data.frame(lapply(df, function(y) gsub('\\.', '', y)))
-
+              
+              df <- as.data.frame(
+                lapply(df, function(y) gsub('-', '', y))
+              )
+              
+              df <- as.data.frame(
+                lapply(df, function(y) gsub('_', '', y))
+              )
+              
+              df <- as.data.frame(
+                lapply(df, function(y) gsub(' ', '', y))
+              )
+              
+              df <- as.data.frame(
+                lapply(df, function(y) gsub('\\.', '', y))
+              )
+              
               df <- df[(which(nchar(df$altLabel) > 2)),]
               df <- df[(which(nchar(df$itemLabel) > 2)),]
-
-              # No marker can start with a number, so add X to any marker names that start with a number
-              df <- as.data.frame(lapply(df, function(y) gsub('^(\\d)', 'X\\1', y)))
-
-              # Vector of unique marker names
-              unique_syn_names <- unique(c(df[, "altLabel"], df[, "itemLabel"]))
-
-              unique_syn_names <- unique_syn_names[!grepl("[^\x01-\x7F]+", unique_syn_names)]
-                                         
-              unique_syn_names <- unique_syn_names[grep('[A-Za-z]',unique_syn_names)]
-
-              unique_syn_names <- unique_syn_names[!grepl(paste0('^', marker, '$'), unique_syn_names, useBytes = TRUE)]
-
-              # Run SPARQL
-              all_ids <- PRO_SPARQL(unique_marker_names = unique_syn_names,
-                                    NCBI_taxon_ID = NCBI_taxon_ID_short,
-                                    onto_endpoint = onto_endpoint,
-                                    Match_step = Match_step)
-
-              # Put all results in one data frame
-              all_ids <- dplyr::bind_rows(all_ids, .id = "Matched synonym")
-
+              
+              df <- as.data.frame(
+                lapply(df, function(y) gsub('^(\\d)', 'X\\1', y))
+              )
+              
+              unique_syn_names <- unique(
+                c(df[, "altLabel"], df[, "itemLabel"])
+              )
+              
+              unique_syn_names <- unique_syn_names[
+                !grepl("[^\x01-\x7F]+", unique_syn_names)
+              ]
+              
+              unique_syn_names <- unique_syn_names[
+                grep('[A-Za-z]', unique_syn_names)
+              ]
+              
+              unique_syn_names <- unique_syn_names[
+                !grepl(
+                  paste0('^', marker, '$'),
+                  unique_syn_names,
+                  useBytes = TRUE
+                )
+              ]
+              
+              all_ids <- PRO_SPARQL(
+                unique_marker_names = unique_syn_names,
+                NCBI_taxon_ID = NCBI_taxon_ID_short,
+                onto_endpoint = onto_endpoint,
+                Match_step = Match_step
+              )
+              
+              all_ids <- dplyr::bind_rows(
+                all_ids,
+                .id = "Matched synonym"
+              )
+              
               all_ids <- stats::na.omit(all_ids)
-
-              if (length(all_ids) != 0) {
+              
+              if(length(all_ids) != 0) {
+                
                 all_ids_final[[marker]] <- all_ids
-              } else if (length(all_ids) == 0) {
-                all_ids_final[[marker]] <- data.frame(PRO_term = "", PRO_name = "", Species = "", Match_step = "", Match_type = "")
+                
+              } else {
+                
+                all_ids_final[[marker]] <-
+                  data.frame(
+                    PRO_term = "",
+                    PRO_name = "",
+                    Species = "",
+                    Match_step = "",
+                    Match_type = ""
+                  )
+                
               }
-            } else if (length(df) == 0) {
-              all_ids_final[[marker]] <- data.frame(PRO_term = "", PRO_name = "", Species = "", Match_step = "", Match_type = "")
+              
+            } else {
+              
+              all_ids_final[[marker]] <-
+                data.frame(
+                  PRO_term = "",
+                  PRO_name = "",
+                  Species = "",
+                  Match_step = "",
+                  Match_type = ""
+                )
+              
             }
           }
-
-        # Put all results in one data frame
-        all_ids_final2 <- dplyr::bind_rows(all_ids_final, .id = "Marker")
-
-        # Remove duplicated entries (Marker, PRO term, and type of match are the same)
-        all_ids_final2 <- all_ids_final2[!duplicated(all_ids_final2[,c("Marker","PRO_term", "Match_type")]),]
-
-        # Get entries were inputted marker and matched species is the same
-
-        # Subset into entries with and without duplicates
-        x <-  all_ids_final2[duplicated(all_ids_final2[,c("Marker","Species")]) | duplicated(all_ids_final2[,c("Marker","Species")], fromLast = TRUE) ,]
-        y <-  dplyr::setdiff(all_ids_final2, x)
-
-        # Get vector of markers (duplicates)
-        unique_marker_names <- unique(x$Marker)
-
-        # If there is both an exact match and a secondary match, remove the secondary
-        remove_secondary_per_marker <- data.frame()
-
-        for(marker in unique_marker_names) {
-          df_subsetted <- x[x$Marker == marker,]
-          if(any(df_subsetted$Match_type == "Primary")) {
-            df_per_marker <- df_subsetted[df_subsetted$Match_type != "Secondary",]
-            df_per_marker <- df_per_marker[df_per_marker$Match_type != "",]
-            remove_secondary_per_marker <- rbind(remove_secondary_per_marker, df_per_marker)
-          } else if(any(df_subsetted$Match_type == "Secondary")) {
-            df_per_marker <- df_subsetted[df_subsetted$Match_type != "",]
-            remove_secondary_per_marker <- rbind(remove_secondary_per_marker, df_per_marker)
+        
+             
+          # Put all results in one data frame
+          all_ids_final2 <- dplyr::bind_rows(all_ids_final, .id = "Marker")
+          
+          # Remove duplicated entries (Marker, PRO term, and type of match are the same)
+          all_ids_final2 <- all_ids_final2[!duplicated(all_ids_final2[,c("Marker","PRO_term", "Match_type")]),]
+          
+          # Get entries were inputted marker and matched species is the same
+          
+          # Subset into entries with and without duplicates
+          x <-  all_ids_final2[duplicated(all_ids_final2[,c("Marker","Species")]) | duplicated(all_ids_final2[,c("Marker","Species")], fromLast = TRUE) ,]
+          y <-  dplyr::setdiff(all_ids_final2, x)
+          
+          # Get vector of markers (duplicates)
+          unique_marker_names <- unique(x$Marker)
+          
+          # If there is both an exact match and a secondary match, remove the secondary
+          remove_secondary_per_marker <- data.frame()
+          
+          for(marker in unique_marker_names) {
+            df_subsetted <- x[x$Marker == marker,]
+            if(any(df_subsetted$Match_type == "Primary")) {
+              df_per_marker <- df_subsetted[df_subsetted$Match_type != "Secondary",]
+              df_per_marker <- df_per_marker[df_per_marker$Match_type != "",]
+              remove_secondary_per_marker <- rbind(remove_secondary_per_marker, df_per_marker)
+            } else if(any(df_subsetted$Match_type == "Secondary")) {
+              df_per_marker <- df_subsetted[df_subsetted$Match_type != "",]
+              remove_secondary_per_marker <- rbind(remove_secondary_per_marker, df_per_marker)
+            }
           }
-        }
-
-        # Final
-        Wikidata_matches <- rbind(remove_secondary_per_marker, y)
-
-        # Just columns we want
-        Wikidata_matches <- unique(Wikidata_matches[ , c("Marker", "PRO_term", "PRO_name", "Species", "Match_type", "Match_step")])
-
+          
+          # Final
+          Wikidata_matches <- rbind(remove_secondary_per_marker, y)
+          
+          # Just columns we want
+          Wikidata_matches <- unique(Wikidata_matches[ , c("Marker", "PRO_term", "PRO_name", "Species", "Match_type", "Match_step")])
+          
         } else {
           Wikidata_matches <- data.frame(Marker = "", PRO_term = "", PRO_name = "", Species = "", Match_type = "", Match_step = "")
         }
@@ -8621,7 +8910,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
       result <- httr::POST(
         onto_endpoint,
         body = list(query = query),
-        httr::user_agent(R.version.string)
+        httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" )
       )
       
       if (httr::status_code(result) != 200) {
@@ -8738,7 +9027,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
     result <- httr::GET(
       url = wiki_endpoint,
       query = list(query = SPARQL_query),
-      httr::user_agent(R.version.string))
+      httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
     # Will show a warning/error if there is any
     httr::stop_for_status(result)
@@ -8983,92 +9272,219 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
 
         # Loop through each and do the SPARQL query
         for(marker in unique_marker_names) {
-
-          specific_marker <-  shQuote(marker)
-
+          
+          specific_marker <- shQuote(marker)
+          
           SPARQL_query <-
             paste0(
               "
 SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
-  # Look either for non-species specific or add a specific species
+
   OPTIONAL {
     ?item wdt:P703 <", wikidata_taxon_ID, "> .
-
   }
-  # Get Wikidata protein name and alternative names
+
   ?item rdfs:label ?itemLabel .
-  ?item skos:altLabel ?altLabel.
-  # Return results that are either proteins or protein-coding genes
-  {?item wdt:P31 wd:Q8054}
+  ?item skos:altLabel ?altLabel .
+
+  { ?item wdt:P31 wd:Q8054 }
   UNION
-  {?item wdt:P279 wd:Q20747295}
-  # Search for the marker input, either if it is the entry name or an alternative name
-  FILTER (UCASE(REPLACE(str(?itemLabel),'[ -.]','')) = ", specific_marker, " || UCASE(REPLACE(str(?altLabel),'[ -.]','')) = ", specific_marker, ")
+  { ?item wdt:P279 wd:Q20747295 }
+
+  FILTER (
+    UCASE(REPLACE(str(?itemLabel),'[ -.]','')) = ", specific_marker, "
+    ||
+    UCASE(REPLACE(str(?altLabel),'[ -.]','')) = ", specific_marker, "
+  )
 }
-")
-          # Run SPARQL on the endpoint
-          result <- httr::GET(
-            url = wiki_endpoint,
-            query = list(query = SPARQL_query),
-            httr::user_agent(R.version.string))
+"
+            )
+          
+          # Retry Wikidata request
+          result <- NULL
+          
+          for(attempt in 1:5) {
+            
+            result <- tryCatch(
+              httr::GET(
+                url = wiki_endpoint,
+                query = list(query = SPARQL_query),
+                httr::user_agent(
+                  "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)"
+                )
+              ),
+              error = function(e) NULL
+            )
+            
+            if (!is.null(result) &&
+                httr::status_code(result) == 200) {
+              break
+            }
+            
+            Sys.sleep(2 ^ attempt)
+          }
+          
+          # Check HTTP response
+          if (is.null(result)) {
 
-          # Get result in text JSON
-          x <- httr::content(result, as = "text") #, encoding = "UTF-8")
-
-          # Convert from JSON to a list
-          df <- jsonlite::fromJSON(x, flatten = TRUE)
-
-          # Extract the data frame
+            all_ids_final[[marker]] <- data.frame(
+              PRO_term = "",
+              PRO_name = "",
+              Species = "",
+              Match_step = "",
+              Match_type = ""
+            )
+            
+            next
+          }
+          
+          status <- httr::status_code(result)
+          
+          if (status != 200) {
+            
+            
+            all_ids_final[[marker]] <- data.frame(
+              PRO_term = "",
+              PRO_name = "",
+              Species = "",
+              Match_step = "",
+              Match_type = ""
+            )
+            
+            next
+          }
+          
+          # Get response text
+          x <- httr::content(
+            result,
+            as = "text",
+            encoding = "UTF-8"
+          )
+          
+          # Validate JSON
+          if (!jsonlite::validate(x)) {
+            
+            all_ids_final[[marker]] <- data.frame(
+              PRO_term = "",
+              PRO_name = "",
+              Species = "",
+              Match_step = "",
+              Match_type = ""
+            )
+            
+            next
+          }
+          
+          # Parse JSON
+          df <- tryCatch(
+            jsonlite::fromJSON(x, flatten = TRUE),
+            error = function(e) NULL
+          )
+          
+          if (is.null(df)) {
+            
+            all_ids_final[[marker]] <- data.frame(
+              PRO_term = "",
+              PRO_name = "",
+              Species = "",
+              Match_step = "",
+              Match_type = ""
+            )
+            
+            next
+          }
+          
           df <- df$results$bindings
-
+          
           if (length(df) != 0) {
-
-            # Remove unneeded info
-            df <- df %>% dplyr::select(-dplyr::ends_with(c(".type", ".datatype", 'lang')))
-
-            # Remove this part that was added onto the column names
+            
+            df <- df %>%
+              dplyr::select(
+                -dplyr::ends_with(
+                  c(".type", ".datatype", "lang")
+                )
+              )
+            
             colnames(df) <- gsub(".value", "", colnames(df))
-
-            # Make everything case, remove spaces, dashes
+            
             df <- dplyr::mutate_all(df, .funs = toupper)
+            
             df <- as.data.frame(lapply(df, function(y) gsub('-', '', y)))
             df <- as.data.frame(lapply(df, function(y) gsub('_', '', y)))
             df <- as.data.frame(lapply(df, function(y) gsub(' ', '', y)))
             df <- as.data.frame(lapply(df, function(y) gsub('\\.', '', y)))
-
-            df <- df[(which(nchar(df$altLabel) > 2)),]
-            df <- df[(which(nchar(df$itemLabel) > 2)),]
-
-            # No marker can start with a number, so add X to any marker names that start with a number
-            df <- as.data.frame(lapply(df, function(y) gsub('^(\\d)', 'X\\1', y)))
-
-            # Vector of unique marker names
-            unique_syn_names <- unique(c(df[, "altLabel"], df[, "itemLabel"]))
-
-             unique_syn_names <- unique_syn_names[!grepl("[^\x01-\x7F]+", unique_syn_names)]
-                                       
-            unique_syn_names <- unique_syn_names[grep('[A-Za-z]',unique_syn_names)]
-
-            unique_syn_names <- unique_syn_names[!grepl(paste0('^', marker, '$'), unique_syn_names, useBytes = TRUE)]
-
-            # Run SPARQL
-            all_ids <- PRO_SPARQL(unique_marker_names = unique_syn_names,
-                                  NCBI_taxon_ID = NCBI_taxon_ID_short,
-                                  onto_endpoint = onto_endpoint,
-                                  Match_step = Match_step)
-
-            # Put all results in one data frame
-            all_ids <- dplyr::bind_rows(all_ids, .id = "Matched synonym")
-
+            
+            df <- df[which(nchar(df$altLabel) > 2), ]
+            df <- df[which(nchar(df$itemLabel) > 2), ]
+            
+            df <- as.data.frame(
+              lapply(df, function(y)
+                gsub('^(\\d)', 'X\\1', y))
+            )
+            
+            unique_syn_names <- unique(
+              c(df[, "altLabel"], df[, "itemLabel"])
+            )
+            
+            unique_syn_names <-
+              unique_syn_names[
+                !grepl("[^\x01-\x7F]+", unique_syn_names)
+              ]
+            
+            unique_syn_names <-
+              unique_syn_names[
+                grep('[A-Za-z]', unique_syn_names)
+              ]
+            
+            unique_syn_names <-
+              unique_syn_names[
+                !grepl(
+                  paste0('^', marker, '$'),
+                  unique_syn_names,
+                  useBytes = TRUE
+                )
+              ]
+            
+            all_ids <- PRO_SPARQL(
+              unique_marker_names = unique_syn_names,
+              NCBI_taxon_ID = NCBI_taxon_ID_short,
+              onto_endpoint = onto_endpoint,
+              Match_step = Match_step
+            )
+            
+            all_ids <- dplyr::bind_rows(
+              all_ids,
+              .id = "Matched synonym"
+            )
+            
             all_ids <- stats::na.omit(all_ids)
-
+            
             if (length(all_ids) != 0) {
+              
               all_ids_final[[marker]] <- all_ids
-            } else if (length(all_ids) == 0) {
-              all_ids_final[[marker]] <- data.frame(PRO_term = "", PRO_name = "", Species = "", Match_step = "", Match_type = "")
+              
+            } else {
+              
+              all_ids_final[[marker]] <- data.frame(
+                PRO_term = "",
+                PRO_name = "",
+                Species = "",
+                Match_step = "",
+                Match_type = ""
+              )
+              
             }
-          } else if (length(df) == 0) {
-            all_ids_final[[marker]] <- data.frame(PRO_term = "", PRO_name = "", Species = "", Match_step = "", Match_type = "")
+            
+          } else {
+            
+            all_ids_final[[marker]] <- data.frame(
+              PRO_term = "",
+              PRO_name = "",
+              Species = "",
+              Match_step = "",
+              Match_type = ""
+            )
+            
           }
         }
 
@@ -9737,7 +10153,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result1 <- httr::POST(onto_endpoint,
                                   body = list(query = query1),
-                                  httr::user_agent(R.version.string))
+                                  httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result1)
@@ -9823,7 +10239,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result1 <- httr::POST(onto_endpoint,
                                   body = list(query = query1),
-                                  httr::user_agent(R.version.string))
+                                  httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result1)
@@ -9907,7 +10323,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result2 <- httr::POST(onto_endpoint,
                                   body = list(query = query2),
-                                  httr::user_agent(R.version.string))
+                                  httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result2)
@@ -10320,7 +10736,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               # Run SPARQL on the endpoint
               result1 <- httr::POST(onto_endpoint,
                                     body = list(query = query1),
-                                    httr::user_agent(R.version.string))
+                                    httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
               # Will show a warning/error if there is any
               httr::stop_for_status(result1)
@@ -10406,7 +10822,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               # Run SPARQL on the endpoint
               result1 <- httr::POST(onto_endpoint,
                                     body = list(query = query1),
-                                    httr::user_agent(R.version.string))
+                                    httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
               # Will show a warning/error if there is any
               httr::stop_for_status(result1)
@@ -10490,7 +10906,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               # Run SPARQL on the endpoint
               result2 <- httr::POST(onto_endpoint,
                                     body = list(query = query2),
-                                    httr::user_agent(R.version.string))
+                                    httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
               # Will show a warning/error if there is any
               httr::stop_for_status(result2)
@@ -10635,7 +11051,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
 
           # Split up into smaller chunks to the SPARQL query can handle the filter
           # Number of cell types per query = 100
-          chunk <- 25
+          chunk <- 10
           total_num_rows <- nrow(unq_cell_types)
           how_to_split  <- rep(1:ceiling(total_num_rows/chunk),each=chunk)[1:total_num_rows]
           final_matched_output_list <- split(unq_cell_types,how_to_split)
@@ -10687,7 +11103,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
             # Run SPARQL on the endpoint
             result <- httr::POST(onto_endpoint,
                                  body = list(query = query),
-                                 httr::user_agent(R.version.string))
+                                 httr::user_agent( "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)" ))
 
             # Will show a warning/error if there is any
             httr::stop_for_status(result)
@@ -10806,21 +11222,67 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
               )
 
             # Run SPARQL on the endpoint
-            result <- httr::GET(
-              url = wiki_endpoint,
-              query = list(query = SPARQL_query),
-              httr::user_agent(R.version.string))
-
-            # Will show a warning/error if there is any
-            httr::stop_for_status(result)
-
-            # Get result in text JSON
-            x <- httr::content(result, as = "text") #, encoding = "UTF-8")
-
-            # Convert from JSON to a list
-            df <- jsonlite::fromJSON(x, flatten = TRUE)
-
-            # Extract the data frame
+            # Query Wikidata with retries
+            result <- NULL
+            
+            for(attempt in 1:5) {
+              
+              result <- tryCatch(
+                httr::GET(
+                  url = wiki_endpoint,
+                  query = list(query = SPARQL_query),
+                  httr::user_agent(
+                    "CytoPheno/1.2.0 (+https://github.com/AndorfLab/CytoPheno)"
+                  )
+                ),
+                error = function(e) NULL
+              )
+              
+              if(!is.null(result) &&
+                 httr::status_code(result) == 200) {
+                break
+              }
+              
+              Sys.sleep(2^attempt)
+            }
+            
+            # If still failed after retries
+            if(is.null(result) ||
+               httr::status_code(result) != 200) {
+              
+              final_matched_output[i, "Wikidata"] <- ""
+              
+              next
+            }
+            
+            # Get response text
+            x <- httr::content(
+              result,
+              as = "text",
+              encoding = "UTF-8"
+            )
+            
+            # Verify JSON
+            if(!jsonlite::validate(x)) {
+              
+              final_matched_output[i, "Wikidata"] <- ""
+              
+              next
+            }
+            
+            # Parse JSON
+            df <- tryCatch(
+              jsonlite::fromJSON(x, flatten = TRUE),
+              error = function(e) NULL
+            )
+            
+            if(is.null(df)) {
+              
+              final_matched_output[i, "Wikidata"] <- ""
+              
+              next
+            }
+            
             df <- df$results$bindings
 
             # Put the results in a list of data frames
@@ -11362,7 +11824,7 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
         selection = 'none',
         rownames = FALSE,
         escape = FALSE,
-        options = list(pageLength = 25)
+        options = list(pageLength = 10)
       )
     }
   }, server=FALSE)
@@ -11411,5 +11873,4 @@ SELECT DISTINCT ?item ?itemLabel ?altLabel WHERE {
     session$reload()
   })
 }
-
 
